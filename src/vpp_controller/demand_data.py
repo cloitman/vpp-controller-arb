@@ -27,7 +27,7 @@ def load_demand_data(file_path: str | Path | None = None) -> pd.DataFrame:
     Returns a DataFrame with the columns needed by the demand builders.
     """
     csv_path = Path(file_path) if file_path is not None else _default_demand_file()
-    df = pd.read_csv(csv_path, sep=";")
+    df = pd.read_csv(csv_path)
     df["UTC time"] = pd.to_datetime(df["UTC time"], format="mixed", dayfirst=True)
     df = df[df["UTC time"].dt.year == 2025]
 
@@ -56,7 +56,7 @@ def build_season_base_demand(
     ].reset_index(drop=True)
 
 
-def create_node_demand(node_row: pd.Series, base_demand: np.ndarray, factor=1) -> pd.DataFrame:
+def create_node_demand(node_row: pd.Series, base_demand: np.ndarray, factor=1,noise = 0.05) -> pd.DataFrame:
     """
     Build noisy P/Q demand trajectories for one node.
 
@@ -69,8 +69,8 @@ def create_node_demand(node_row: pd.Series, base_demand: np.ndarray, factor=1) -
     p_scaled = (base_demand / base_demand.mean()) * p_mean
     q_scaled = (base_demand / base_demand.mean()) * q_mean
 
-    std_p = p_mean * 0.05
-    std_q = q_mean * 0.05
+    std_p = p_mean * noise
+    std_q = q_mean * noise
 
     rng_p = np.random.default_rng(seed=int(node))
     rng_q = np.random.default_rng(seed=int(node) + 10)
@@ -91,13 +91,18 @@ def create_all_nodes_demand(
     nodes_df: pd.DataFrame,
     season: str,
     factor = 1.0,
+    noise = 0.05,
     seasonal_base_df: pd.DataFrame | None = None,
     demand_file_path: str | Path | None = None,
+    shift_by_node: bool = False,
 ) -> pd.DataFrame:
     """
     Build demand profiles for all nodes for a specific season.
 
     Returns DataFrame columns: timestamp, node, P_demand, Q_demand.
+
+    If shift_by_node=True, the base demand profile for node k is cyclically
+    shifted by k hours so that peaks and troughs no longer coincide across nodes.
     """
     if season not in SEASON_DATES:
         raise ValueError(f"Season must be one of: {list(SEASON_DATES.keys())}")
@@ -118,7 +123,8 @@ def create_all_nodes_demand(
 
     all_nodes = []
     for _, node_row in nodes_df.iterrows():
-        df_node = create_node_demand(node_row, base_demand, factor)
+        node_base = np.roll(base_demand, int(node_row["node"])) if shift_by_node else base_demand
+        df_node = create_node_demand(node_row, node_base, factor, noise)
         df_node.insert(0, "timestamp", timestamps)
         all_nodes.append(df_node)
 
