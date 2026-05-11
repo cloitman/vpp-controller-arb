@@ -574,6 +574,160 @@ def plot_node_dispatch_and_lmp(results_list, node, OUT_PATH, normalize=False):
 
 
 # ---------------------------------------------------------------------------
+# Generation and voltage impact of batteries
+# ---------------------------------------------------------------------------
+
+def plot_generation_and_cost(results_list, OUT_PATH):
+    """Two-panel plot: total system generation and cost per hour, with vs without batteries.
+
+    Top panel: total active power generation summed across all nodes (MW).
+    Bottom panel: total generation cost ($/h = sum_j c[j,t] * p[j,t]).
+
+    The 'no battery' baseline (Stage 1 OPF) is a single dashed black line.
+    Each capacity scenario (Stage 2 post-battery OPF) is a coloured line.
+
+    Args:
+        results_list: list of results dicts.
+        OUT_PATH: output folder.
+    """
+    required = {"p_no_batt", "p_post_batt", "c_{i,t}"}
+    ref = results_list[0]
+    if not required.issubset(ref["variables"]):
+        missing = required - set(ref["variables"])
+        print(f"plot_generation_and_cost: missing variables {missing}, skipping.")
+        return
+
+    sorted_results = sorted(results_list, key=lambda r: sum(r["variables"]["e^{batt}_{j,max}"]))
+    n_scen = len(sorted_results)
+    colors = [plt.cm.viridis(i / max(n_scen - 1, 1)) for i in range(n_scen)]
+
+    p_no_batt = np.array(sorted_results[0]["variables"]["p_no_batt"], dtype=float)
+    c_mat = np.array(sorted_results[0]["variables"]["c_{i,t}"], dtype=float)
+    gen_no_batt = p_no_batt.sum(axis=0)          # sum over nodes → shape (n_time,)
+    cost_no_batt = (c_mat * p_no_batt).sum(axis=0)
+    hours = np.arange(len(gen_no_batt))
+
+    fig, (ax_gen, ax_cost) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+
+    ax_gen.plot(hours, gen_no_batt, color="black", linewidth=2, linestyle="--",
+                label="No battery", zorder=5)
+    ax_cost.plot(hours, cost_no_batt, color="black", linewidth=2, linestyle="--",
+                 label="No battery", zorder=5)
+
+    cap_handles = [Line2D([0], [0], color="black", linewidth=2, linestyle="--",
+                          label="No battery")]
+    for r, color in zip(sorted_results, colors):
+        total_cap = sum(r["variables"]["e^{batt}_{j,max}"])
+        p_post = np.array(r["variables"]["p_post_batt"], dtype=float)
+        gen_post = p_post.sum(axis=0)
+        cost_post = (c_mat * p_post).sum(axis=0)
+        ax_gen.plot(hours, gen_post, color=color, linewidth=1.5, alpha=0.85)
+        ax_cost.plot(hours, cost_post, color=color, linewidth=1.5, alpha=0.85)
+        cap_handles.append(
+            Line2D([0], [0], color=color, linewidth=2, label=f"{total_cap:.1f} MWh")
+        )
+
+    ax_gen.set_ylabel("Total Generation (MW)")
+    ax_gen.set_title("System Generation With and Without Batteries")
+    ax_gen.grid(True, linestyle="--", alpha=0.4)
+
+    ax_cost.set_xlabel("Hour")
+    ax_cost.set_ylabel("Total Generation Cost ($/h)")
+    ax_cost.set_title("System Generation Cost With and Without Batteries")
+    ax_cost.grid(True, linestyle="--", alpha=0.4)
+
+    ax_gen.legend(handles=cap_handles, title="Battery Capacity",
+                  bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(OUT_PATH / "generation_and_cost.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_voltage_by_capacity(results_list, node, OUT_PATH):
+    """Line chart: per-unit voltage at one node over time, with v_min/v_max bounds.
+
+    The dashed black line is the no-battery voltage (Stage 1, hard bounds enforced).
+    Each coloured line is the post-battery voltage from the voltage-slack OPF, which
+    is allowed to exceed the bounds — showing where batteries naturally push voltage.
+    Red shading marks the infeasible regions (outside the hard bounds).
+
+    Note: V_{i,t} stored in results is |V|^2 in p.u., so this function takes sqrt.
+
+    Args:
+        results_list: list of results dicts.
+        node: integer node index to plot.
+        OUT_PATH: output folder.
+    """
+    required = {"V_no_batt", "V_post_batt", "v_min", "v_max"}
+    ref = results_list[0]
+    if not required.issubset(ref["variables"]):
+        missing = required - set(ref["variables"])
+        print(f"plot_voltage_by_capacity node {node}: missing variables {missing}, skipping.")
+        return
+
+    sorted_results = sorted(results_list, key=lambda r: sum(r["variables"]["e^{batt}_{j,max}"]))
+    n_scen = len(sorted_results)
+    colors = [plt.cm.viridis(i / max(n_scen - 1, 1)) for i in range(n_scen)]
+
+    V_no_batt = np.array(sorted_results[0]["variables"]["V_no_batt"], dtype=float)
+    v_no_batt_node = np.sqrt(np.maximum(V_no_batt[node, :], 0.0))
+    hours = np.arange(len(v_no_batt_node))
+
+    v_min = float(np.array(sorted_results[0]["variables"]["v_min"]).flat[0])
+    v_max = float(np.array(sorted_results[0]["variables"]["v_max"]).flat[0])
+
+    # Collect all post-battery voltages to set y-axis limits sensibly.
+    all_post_v = []
+    for r in sorted_results:
+        V_post = np.array(r["variables"]["V_post_batt"], dtype=float)
+        all_post_v.append(np.sqrt(np.maximum(V_post[node, :], 0.0)))
+
+    y_lo = min(v_min - 0.02, min(v.min() for v in all_post_v) - 0.01)
+    y_hi = max(v_max + 0.02, max(v.max() for v in all_post_v) + 0.01)
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+
+    # Shade infeasible regions.
+    ax.axhspan(y_lo, v_min, color="red", alpha=0.08, zorder=0)
+    ax.axhspan(v_max, y_hi, color="red", alpha=0.08, zorder=0)
+
+    # Hard-bound reference lines.
+    ax.axhline(v_min, color="red", linewidth=1.3, linestyle="--")
+    ax.axhline(v_max, color="red", linewidth=1.3, linestyle="--")
+
+    # No-battery baseline.
+    ax.plot(hours, v_no_batt_node, color="black", linewidth=2, linestyle="--", zorder=5)
+
+    cap_handles = [Line2D([0], [0], color="black", linewidth=2, linestyle="--",
+                          label="No battery (within bounds)")]
+    for r, color, v_post_node in zip(sorted_results, colors, all_post_v):
+        total_cap = sum(r["variables"]["e^{batt}_{j,max}"])
+        ax.plot(hours, v_post_node, color=color, linewidth=1.5, alpha=0.85)
+        cap_handles.append(
+            Line2D([0], [0], color=color, linewidth=2, label=f"{total_cap:.1f} MWh")
+        )
+
+    bound_handles = [
+        Line2D([0], [0], color="red", linewidth=1.5, linestyle="--",
+               label=f"v_min / v_max = {v_min} / {v_max} p.u."),
+        Patch(facecolor="red", alpha=0.15, label="Infeasible region"),
+    ]
+    ax.legend(handles=cap_handles + bound_handles, title="Scenario / Bounds",
+              bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
+    ax.set_xlabel("Hour")
+    ax.set_ylabel("Voltage (p.u.)")
+    ax.set_ylim(y_lo, y_hi)
+    ax.set_title(
+        f"Voltage at Node {node} — Post-battery voltages use relaxed bounds\n"
+        f"(shaded = outside hard constraints)"
+    )
+    ax.grid(True, linestyle="--", alpha=0.4)
+    fig.tight_layout()
+    fig.savefig(OUT_PATH / f"node_{node}_voltage_by_capacity.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
 # Generic 3D / multi-version utilities (unchanged)
 # ---------------------------------------------------------------------------
 
@@ -674,7 +828,11 @@ def main(date_string):
     results_list = []
     
     for file in json_files:
-        results_dict = get_results_dict(file)
+        try:
+            results_dict = get_results_dict(file)
+        except Exception as e:
+            print(f"Error reading {file}: {e}")
+            import pdb;pdb.set_trace()
 
         # Per-scenario 3D plots
         plot_battery_dispatch_3d(results_dict, OUT_PATH, normalize=False, filter_small_nodes=False)
@@ -713,6 +871,17 @@ def main(date_string):
     plot_capacity_allocation(results_list, OUT_PATH)
     plot_node_profit_by_capacity(results_list, OUT_PATH)
 
+    try:
+        plot_generation_and_cost(results_list, OUT_PATH)
+    except Exception as e:
+        print(f"  plot_generation_and_cost: {e}")
+
+    for interestNode in range(n_nodes):
+        try:
+            plot_voltage_by_capacity(results_list, interestNode, OUT_PATH)
+        except Exception as e:
+            print(f"  plot_voltage_by_capacity node {interestNode}: {e}")
+
 
 def find_files_by_date(date_str):
     json_files = []
@@ -748,6 +917,6 @@ def main_multi_version(versions=("v_1", "v_2", "v_3", "v_4")):
 
 
 if __name__ == "__main__":
-    date_string = "spring4"
+    date_string = "spring_neg_costs_root_battery"
     main(date_string)
     # main_multi_version()
