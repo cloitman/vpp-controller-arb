@@ -71,6 +71,7 @@ def run_lmp_problem(
     topology_df: pd.DataFrame,
     demand_df: pd.DataFrame,
     price_df_root_node: pd.DataFrame,
+    voltage_slack_penalty: float = 0.0,
 ) -> Tuple[np.ndarray, DayOptimizationResult]:
     """
     Stage 1: solve the no-battery, no-slack OPF and extract LMPs.
@@ -100,6 +101,7 @@ def run_lmp_problem(
         topology_df=topology_df,
         demand_df=demand_df,
         price_series_root_node=price_series,
+        voltage_slack_penalty=voltage_slack_penalty,
     )
 
     formulation = formulate_vpp_problem_minimization(**model_inputs)
@@ -109,7 +111,7 @@ def run_lmp_problem(
     n_time = formulation.dimensions["|T|"]
     node_order: list[int] = formulation.dimensions["active_power_balance_node_order"]
     balance_constraints = formulation.constraints["active_power_balance"]
-
+    
     # LMP[j, t] = -dual_value of the active power balance constraint for node j
     lmp = np.zeros((n_nodes, n_time))
     for ci, j_idx in enumerate(node_order):
@@ -125,6 +127,9 @@ def run_lmp_problem(
         name: np.array(var.value) if hasattr(var, "value") else np.array(var)
         for name, var in formulation.variables.items()
     }
+    # Store root-node generation cost per hour so callers can compute weighted cost.
+    variables["c_root_t"] = model_inputs["c"][0, :]
+
     diagnostics = {
         "solver": formulation.problem.solver_stats.solver_name,
         "solve_time": formulation.problem.solver_stats.solve_time,
@@ -132,7 +137,7 @@ def run_lmp_problem(
         "dimensions": formulation.dimensions,
         "lmp": lmp,
     }
-    
+
     result = DayOptimizationResult(
         status=formulation.problem.status,
         objective_value=cast(float | None, formulation.problem.value),
@@ -213,6 +218,7 @@ def build_model_inputs_minimization(
     topology_df: pd.DataFrame,
     demand_df: pd.DataFrame,
     price_series_root_node: pd.Series | np.ndarray,
+    voltage_slack_penalty: float = 0.0,
 ) -> Dict[str, Any]:
     """Build keyword-argument dict for formulate_vpp_problem_minimization."""
     node_col = _detect_node_column(topology_df)
@@ -269,6 +275,7 @@ def build_model_inputs_minimization(
         "v_min": v_min,
         "v_max": v_max,
         "v_0": 1.0,
+        "voltage_slack_penalty": voltage_slack_penalty,
     }
 
 
@@ -330,7 +337,7 @@ def run_post_battery_lmp_problem(
     demand_df: pd.DataFrame,
     price_df_root_node: pd.DataFrame,
     arb_result: DayOptimizationResult,
-) -> np.ndarray:
+) -> Tuple[np.ndarray, DayOptimizationResult]:
     """
     Compute post-battery LMPs by re-running Stage 1 with battery net injections
     subtracted from nodal demand.
@@ -341,12 +348,94 @@ def run_post_battery_lmp_problem(
 
     Returns
     -------
-    np.ndarray, shape (n_nodes, n_time)
+    post_lmp : np.ndarray, shape (n_nodes, n_time)
+    post_result : DayOptimizationResult
+        Full OPF result with p_{i,t} (generation) and V_{i,t} (squared voltage).
     """
     p_batt_net = np.array(arb_result.variables["P^{batt}_{j,t}"], dtype=float)
     modified_demand_df = _subtract_battery_from_demand(demand_df, p_batt_net)
-    post_lmp, _ = run_lmp_problem(topology_df, modified_demand_df, price_df_root_node)
-    return post_lmp
+    post_lmp, post_result = run_lmp_problem(
+        topology_df, modified_demand_df, price_df_root_node,
+        voltage_slack_penalty=1e4,
+    )
+    if post_result.status not in ("optimal", "optimal_inaccurate"):
+        _diagnose_post_battery_infeasibility(modified_demand_df, p_batt_net, post_result)
+    return post_lmp, post_result
+
+
+def _diagnose_post_battery_infeasibility(
+    modified_demand_df: pd.DataFrame,
+    p_batt_net: np.ndarray,
+    post_result: DayOptimizationResult,
+) -> None:
+    """Print diagnostic info when the post-battery OPF is infeasible."""
+    n_nodes, n_time = p_batt_net.shape
+
+    # Rebuild effective demand matrix from the modified demand dataframe.
+    l_P_eff = np.zeros((n_nodes, n_time))
+    for _, row in modified_demand_df.iterrows():
+        n, h = int(row["node"]), int(row["hour"])
+        if n < n_nodes and h < n_time:
+            l_P_eff[n, h] = float(row["l_P"])
+
+    print("\n  ── Stage 3 Infeasibility Diagnostic ─────────────────────────")
+    print(f"  Solver status : {post_result.status}")
+
+    # 1. Effective demand statistics
+    neg = [(j, t, l_P_eff[j, t])
+           for j in range(n_nodes) for t in range(n_time)
+           if l_P_eff[j, t] < -1e-4]
+    if neg:
+        print(f"\n  Negative effective demand (battery exports exceed local load):")
+        print(f"    Count : {len(neg)} (node, hour) pairs")
+        worst = min(neg, key=lambda x: x[2])
+        print(f"    Worst : node {worst[0]}, hour {worst[1]}, l_P_eff = {worst[2]:.4f} MW")
+        # Per-node worst
+        per_node_min = {j: min((v for nn, _, v in neg if nn == j), default=0.0)
+                        for j in range(n_nodes)}
+        for j, v in per_node_min.items():
+            if v < -1e-4:
+                print(f"    Node {j:2d}: min l_P_eff = {v:.4f} MW")
+    else:
+        print(f"\n  Effective demand: all non-negative "
+              f"(range [{l_P_eff.min():.4f}, {l_P_eff.max():.4f}] MW)")
+
+    # 2. Battery dispatch summary
+    print(f"\n  Battery dispatch (P_batt = discharge − charge):")
+    print(f"    Max discharge : {p_batt_net.max():.4f} MW")
+    print(f"    Max charge    : {(-p_batt_net).clip(min=0).max():.4f} MW")
+    net_per_node = p_batt_net.sum(axis=1)
+    for j, net in enumerate(net_per_node):
+        if abs(net) > 1e-4:
+            print(f"    Node {j:2d} daily net : {net:+.4f} MWh "
+                  f"({'discharge' if net > 0 else 'charge'})")
+
+    # 3. Constraint violations — only meaningful if solver populated variable values.
+    # ECOS returns no primal point on infeasible problems, so violations will be None.
+    violated: Dict[str, Tuple[int, float]] = {}
+    for group, duals_list in post_result.duals.items():
+        # proxy: check if any dual is unusually large (indicates active constraint)
+        big = [abs(float(np.asarray(d).flat[0]))
+               for d in duals_list
+               if d is not None and not np.any(np.isnan(np.asarray(d, dtype=float)))]
+        if big and max(big) > 1e3:
+            violated[group] = (len(big), max(big))
+
+    if violated:
+        print("\n  Constraints with very large duals (likely binding/violated):")
+        for group, (cnt, mx) in sorted(violated.items(), key=lambda x: -x[1][1]):
+            print(f"    {group}: {cnt} constraints, max |dual| = {mx:.2e}")
+    else:
+        print("\n  No primal point from solver — constraint violations cannot be computed "
+              "directly.")
+        print("  Likely causes:")
+        if neg:
+            print("    • Battery discharge causes reverse power flow → voltage may rise "
+                  "above v_max at nodes receiving battery exports.")
+        print("    • Check v_min / v_max bounds in the topology CSV.")
+        print("    • Check s_max at the root node vs. total effective load.")
+
+    print("  ─────────────────────────────────────────────────────────────\n")
 
 
 def _subtract_battery_from_demand(demand_df: pd.DataFrame, p_batt_net: np.ndarray) -> pd.DataFrame:

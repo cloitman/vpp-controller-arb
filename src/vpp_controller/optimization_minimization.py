@@ -32,6 +32,7 @@ def formulate_vpp_problem_minimization(
     v_min: float,
     v_max: float,
     v_0: float = 1.0,
+    voltage_slack_penalty: float = 0.0,
 ) -> VPPFormulation:
     """
     Solve the no-battery OPF to compute Locational Marginal Prices (LMPs).
@@ -97,6 +98,14 @@ def formulate_vpp_problem_minimization(
     L_e = cp.Variable((n_edges, n_time), nonneg=True, name="L_{ij,t}")
     V = cp.Variable((n_nodes, n_time), name="V_{i,t}")
 
+    # Slack variables for soft voltage bounds (only created when penalty > 0).
+    # V_slack_above[j,t]: how far V[j,t] exceeds v_max^2 (in p.u.^2)
+    # V_slack_below[j,t]: how far V[j,t] falls below v_min^2 (in p.u.^2)
+    use_voltage_slack = voltage_slack_penalty > 0.0
+    if use_voltage_slack:
+        V_slack_above = cp.Variable((n_nodes, n_time), nonneg=True, name="V_slack_above_{i,t}")
+        V_slack_below = cp.Variable((n_nodes, n_time), nonneg=True, name="V_slack_below_{i,t}")
+
     # -------------------------------------------------------------------------
     # Constraints
     # -------------------------------------------------------------------------
@@ -109,8 +118,17 @@ def formulate_vpp_problem_minimization(
     for node in node_ids:
         j_idx = node_to_idx[node]
         for t_idx in range(n_time):
-            constraints["voltage_bounds"].append(V[j_idx, t_idx] >= v_min**2)
-            constraints["voltage_bounds"].append(V[j_idx, t_idx] <= v_max**2)
+            if use_voltage_slack:
+                # Soft bounds: violation absorbed by slack variables.
+                constraints["voltage_bounds"].append(
+                    V[j_idx, t_idx] >= v_min**2 - V_slack_below[j_idx, t_idx]
+                )
+                constraints["voltage_bounds"].append(
+                    V[j_idx, t_idx] <= v_max**2 + V_slack_above[j_idx, t_idx]
+                )
+            else:
+                constraints["voltage_bounds"].append(V[j_idx, t_idx] >= v_min**2)
+                constraints["voltage_bounds"].append(V[j_idx, t_idx] <= v_max**2)
             constraints["generator_apparent_power"].append(
                 cp.norm(cp.hstack([p[j_idx, t_idx], q[j_idx, t_idx]]), 2)
                 <= s[j_idx, t_idx]
@@ -195,8 +213,14 @@ def formulate_vpp_problem_minimization(
 
     # -------------------------------------------------------------------------
     # Objective: minimize generation cost at root node
+    # When voltage slack is active, add a large penalty to discourage violations.
     # -------------------------------------------------------------------------
-    objective = cp.Minimize(cp.sum(cp.multiply(c, p)))
+    generation_cost = cp.sum(cp.multiply(c, p))
+    if use_voltage_slack:
+        slack_penalty = voltage_slack_penalty * cp.sum(V_slack_above + V_slack_below)
+        objective = cp.Minimize(generation_cost + slack_penalty)
+    else:
+        objective = cp.Minimize(generation_cost)
 
     all_constraints = [con for group in constraints.values() for con in group]
     problem = cp.Problem(objective, all_constraints)
@@ -210,6 +234,9 @@ def formulate_vpp_problem_minimization(
         "L_{ij,t}": L_e,
         "V_{i,t}": V,
     }
+    if use_voltage_slack:
+        variables["V_slack_above_{i,t}"] = V_slack_above
+        variables["V_slack_below_{i,t}"] = V_slack_below
 
     dimensions: Dict[str, Any] = {
         "|N|": n_nodes,

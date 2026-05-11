@@ -10,7 +10,7 @@ from src.vpp_controller.runner import (
     run_post_battery_lmp_problem,
 )
 
-opVersion = 'spring4'
+opVersion = 'spring5'
 
 
 def main() -> None:
@@ -54,14 +54,21 @@ def main() -> None:
 
         print(f"  Status: {arb_result.status}  |  Profit: {arb_result.objective_value:.2f}")
 
-        print("  Stage 3: computing post-battery LMPs")
-        post_lmp = run_post_battery_lmp_problem(
+        print("  Stage 3: computing post-battery LMPs and OPF")
+        post_lmp, post_result = run_post_battery_lmp_problem(
             topology_df=topology_df,
             demand_df=demand_df,
             price_df_root_node=price_df,
             arb_result=arb_result,
         )
         arb_result.variables["post_battery_lmp"] = post_lmp
+        arb_result.variables["p_post_batt"] = post_result.variables["p_{i,t}"]
+        arb_result.variables["V_post_batt"] = post_result.variables["V_{i,t}"]
+        arb_result.variables["p_no_batt"] = lmp_result.variables["p_{i,t}"]
+        arb_result.variables["V_no_batt"] = lmp_result.variables["V_{i,t}"]
+        arb_result.variables["c_root_t"] = lmp_result.variables["c_root_t"]
+        arb_result.variables["v_min"] = np.array([float(topology_df["v_min"].iloc[0])])
+        arb_result.variables["v_max"] = np.array([float(topology_df["v_max"].iloc[0])])
 
         save_day_optimization_result(arb_result, batt_cap, opVersion)
 
