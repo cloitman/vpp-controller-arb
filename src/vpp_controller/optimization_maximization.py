@@ -32,6 +32,7 @@ def formulate_battery_opf_problem(
     e_batt_max: float,
     v_0: float = 1.0,
     voltage_slack_penalty: float = 0.0,
+    allow_battery_at_root: bool = False,
 ) -> VPPFormulation:
     """
     Stage 2: network-constrained battery OPF.
@@ -159,15 +160,21 @@ def formulate_battery_opf_problem(
         j_idx = node_to_idx[node]
 
         if j_idx == root_node_idx:
-            # Root has no battery. Generation supplies all outgoing flow.
+            # Root has no parent edge. Generation + battery supplies all outgoing flow.
+            # When allow_battery_at_root=False, e_batt_max_by_node[root]=0 forces
+            # P_batt_net and Q_batt to zero, reducing this to p == children_P.
             children_P: Any = np.zeros(n_time)
             children_Q: Any = np.zeros(n_time)
             for e_idx in outgoing_edges_by_node[node]:
                 children_P = children_P + P_e[e_idx, :]
                 children_Q = children_Q + Q_e[e_idx, :]
 
-            constraints["active_power_balance"].append(p[j_idx, :] == children_P)
-            constraints["reactive_power_balance"].append(q[j_idx, :] == children_Q)
+            constraints["active_power_balance"].append(
+                p[j_idx, :] + P_batt_net[j_idx, :] == children_P
+            )
+            constraints["reactive_power_balance"].append(
+                q[j_idx, :] + Q_batt[j_idx, :] == children_Q
+            )
             lmp_node_order.append(j_idx)
             continue
 
@@ -273,8 +280,11 @@ def formulate_battery_opf_problem(
     # Total energy budget across all nodes
     constraints["battery_total_capacity"] = [cp.sum(e_batt_max_by_node) <= e_batt_max]
 
-    # No battery at root node (root is a generator/substation)
-    constraints["no_battery_at_root"] = [e_batt_max_by_node[root_node_idx] == 0.0]
+    # Root battery exclusion — omit when allow_battery_at_root=True
+    if not allow_battery_at_root:
+        constraints["no_battery_at_root"] = [e_batt_max_by_node[root_node_idx] == 0.0]
+    else:
+        constraints["no_battery_at_root"] = []
 
     # -------------------------------------------------------------------------
     # Objective: maximise battery arbitrage profit (LMPs are fixed Stage-1 prices)

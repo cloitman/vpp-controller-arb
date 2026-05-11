@@ -72,6 +72,9 @@ def run_lmp_problem(
     demand_df: pd.DataFrame,
     price_df_root_node: pd.DataFrame,
     voltage_slack_penalty: float = 0.0,
+    cost_noise: float = 0.1,
+    clip_cost_positive: bool = True,
+    shift_cost_by_node: bool = False,
 ) -> Tuple[np.ndarray, DayOptimizationResult]:
     """
     Stage 1: solve the no-battery, no-slack OPF and extract LMPs.
@@ -102,6 +105,9 @@ def run_lmp_problem(
         demand_df=demand_df,
         price_series_root_node=price_series,
         voltage_slack_penalty=voltage_slack_penalty,
+        cost_noise=cost_noise,
+        clip_cost_positive=clip_cost_positive,
+        shift_cost_by_node=shift_cost_by_node,
     )
 
     formulation = formulate_vpp_problem_minimization(**model_inputs)
@@ -127,8 +133,8 @@ def run_lmp_problem(
         name: np.array(var.value) if hasattr(var, "value") else np.array(var)
         for name, var in formulation.variables.items()
     }
-    # Store root-node generation cost per hour so callers can compute weighted cost.
-    variables["c_root_t"] = model_inputs["c"][0, :]
+    # Store full per-node generation cost matrix for downstream cost computations.
+    variables["c_{i,t}"] = model_inputs["c"]
 
     diagnostics = {
         "solver": formulation.problem.solver_stats.solver_name,
@@ -159,6 +165,10 @@ def run_battery_arbitrage_problem(
     lmp: np.ndarray,
     total_battery_capacity: float,
     voltage_slack_penalty: float = 0.0,
+    cost_noise: float = 0.1,
+    clip_cost_positive: bool = True,
+    shift_cost_by_node: bool = False,
+    allow_battery_at_root: bool = False,
 ) -> DayOptimizationResult:
     """
     Stage 2: network-constrained battery OPF to maximise LMP arbitrage profit.
@@ -191,6 +201,10 @@ def run_battery_arbitrage_problem(
         lmp=lmp,
         total_battery_capacity=total_battery_capacity,
         voltage_slack_penalty=voltage_slack_penalty,
+        cost_noise=cost_noise,
+        clip_cost_positive=clip_cost_positive,
+        shift_cost_by_node=shift_cost_by_node,
+        allow_battery_at_root=allow_battery_at_root,
     )
 
     formulation = formulate_battery_opf_problem(**model_inputs)
@@ -245,6 +259,9 @@ def build_model_inputs_minimization(
     demand_df: pd.DataFrame,
     price_series_root_node: pd.Series | np.ndarray,
     voltage_slack_penalty: float = 0.0,
+    cost_noise: float = 0.1,
+    clip_cost_positive: bool = True,
+    shift_cost_by_node: bool = False,
 ) -> Dict[str, Any]:
     """Build keyword-argument dict for formulate_vpp_problem_minimization."""
     node_col = _detect_node_column(topology_df)
@@ -278,11 +295,16 @@ def build_model_inputs_minimization(
     if price.shape[0] != hourly_l_P.shape[1]:
         raise ValueError("Price curve length must match number of time steps.")
 
-    # Cost is non-zero only at root node (index 0)
-    c = np.zeros_like(hourly_l_P)
-    c[0, :] = price
-
     s_max = topology_df["s_max"].to_numpy(dtype=float)
+    c = _build_generation_cost(
+        nodes=nodes,
+        s_max=s_max,
+        price=price,
+        noise=cost_noise,
+        clip_positive=clip_cost_positive,
+        shift_by_node=shift_cost_by_node,
+    )
+
     v_min = float(topology_df["v_min"].iloc[0])
     v_max = float(topology_df["v_max"].iloc[0])
 
@@ -313,6 +335,10 @@ def build_model_inputs_maximization(
     lmp: np.ndarray,
     total_battery_capacity: float,
     voltage_slack_penalty: float = 0.0,
+    cost_noise: float = 0.1,
+    clip_cost_positive: bool = True,
+    shift_cost_by_node: bool = False,
+    allow_battery_at_root: bool = False,
 ) -> Dict[str, Any]:
     """Build keyword-argument dict for formulate_battery_opf_problem."""
     node_col = _detect_node_column(topology_df)
@@ -352,10 +378,16 @@ def build_model_inputs_maximization(
     if price.shape[0] != n_time:
         raise ValueError("Price curve length must match number of time steps.")
 
-    c = np.zeros_like(hourly_l_P)
-    c[0, :] = price
-
     s_max = topology_df["s_max"].to_numpy(dtype=float)
+    c = _build_generation_cost(
+        nodes=nodes,
+        s_max=s_max,
+        price=price,
+        noise=cost_noise,
+        clip_positive=clip_cost_positive,
+        shift_by_node=shift_cost_by_node,
+    )
+
     v_min = float(topology_df["v_min"].iloc[0])
     v_max = float(topology_df["v_max"].iloc[0])
 
@@ -382,6 +414,7 @@ def build_model_inputs_maximization(
         "e_batt_max": float(total_battery_capacity),
         "v_0": 1.0,
         "voltage_slack_penalty": voltage_slack_penalty,
+        "allow_battery_at_root": allow_battery_at_root,
     }
 
 
@@ -511,6 +544,39 @@ def _subtract_battery_from_demand(demand_df: pd.DataFrame, p_batt_net: np.ndarra
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+def _build_generation_cost(
+    nodes: np.ndarray,
+    s_max: np.ndarray,
+    price: np.ndarray,
+    noise: float = 0.1,
+    clip_positive: bool = True,
+    shift_by_node: bool = False,
+) -> np.ndarray:
+    """
+    Build generation cost matrix c of shape (n_nodes, n_time).
+
+    Every node with s_max[j] > 0 receives a per-node price multiplier drawn
+    from N(1, noise) seeded by node_id + 100 (distinct from demand seeds).
+    If clip_positive=True, the multiplier is floored at 0.1 so costs stay
+    positive.  If shift_by_node=True, the price profile at node j is cyclically
+    shifted by j hours (analogous to demand shift_by_node).
+    Nodes with s_max[j] == 0 remain zero (no generation, no cost).
+    """
+    n_nodes = len(nodes)
+    n_time = len(price)
+    c = np.zeros((n_nodes, n_time), dtype=float)
+    for j, (node_id, s) in enumerate(zip(nodes, s_max)):
+        if s <= 0.0:
+            continue
+        rng = np.random.default_rng(seed=int(node_id) + 100)
+        scale = 1.0 + noise * float(rng.standard_normal())
+        if clip_positive:
+            scale = max(0.1, scale)
+        base = np.roll(price, int(node_id)) if shift_by_node else price.copy()
+        c[j, :] = base * scale
+    return c
+
 
 def _solve_for_lmp_duals(problem: cp.Problem, verbose: bool = True) -> None:
     """Solve the OPF preferring solvers that reliably populate dual variables."""

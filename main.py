@@ -9,7 +9,7 @@ from src.vpp_controller.runner import (
     run_lmp_problem,
 )
 
-opVersion = 'spring6'
+opVersion = 'spring_neg_costs_root_battery'
 
 
 def main() -> None:
@@ -33,6 +33,8 @@ def main() -> None:
         topology_df=topology_df,
         demand_df=demand_df,
         price_df_root_node=price_df,
+        clip_cost_positive=False,
+        shift_cost_by_node=False,
     )
     print(f"  Status: {lmp_result.status}  |  Cost: {lmp_result.objective_value:.2f}")
 
@@ -50,6 +52,9 @@ def main() -> None:
             price_df_root_node=price_df,
             lmp=lmp,
             total_battery_capacity=batt_cap,
+            clip_cost_positive=False,
+            shift_cost_by_node=False,
+            allow_battery_at_root=True,
         )
 
         print(f"  Status: {arb_result.status}  |  Profit: {arb_result.objective_value:.2f}")
@@ -60,7 +65,7 @@ def main() -> None:
         arb_result.variables["V_post_batt"] = arb_result.variables["V_{i,t}"]
         arb_result.variables["p_no_batt"] = lmp_result.variables["p_{i,t}"]
         arb_result.variables["V_no_batt"] = lmp_result.variables["V_{i,t}"]
-        arb_result.variables["c_root_t"] = lmp_result.variables["c_root_t"]
+        arb_result.variables["c_{i,t}"] = lmp_result.variables["c_{i,t}"]
         arb_result.variables["v_min"] = np.array([float(topology_df["v_min"].iloc[0])])
         arb_result.variables["v_max"] = np.array([float(topology_df["v_max"].iloc[0])])
 

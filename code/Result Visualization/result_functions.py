@@ -578,19 +578,19 @@ def plot_node_dispatch_and_lmp(results_list, node, OUT_PATH, normalize=False):
 # ---------------------------------------------------------------------------
 
 def plot_generation_and_cost(results_list, OUT_PATH):
-    """Two-panel plot: total generation and weighted cost per hour, with vs without batteries.
+    """Two-panel plot: total system generation and cost per hour, with vs without batteries.
 
-    Top panel: root-node active power generation (MWh/h) over time.
-    Bottom panel: generation cost ($/h = cost_rate * generation) over time.
+    Top panel: total active power generation summed across all nodes (MW).
+    Bottom panel: total generation cost ($/h = sum_j c[j,t] * p[j,t]).
 
     The 'no battery' baseline (Stage 1 OPF) is a single dashed black line.
-    Each capacity scenario (Stage 3 post-battery OPF) is a coloured line.
+    Each capacity scenario (Stage 2 post-battery OPF) is a coloured line.
 
     Args:
         results_list: list of results dicts.
         OUT_PATH: output folder.
     """
-    required = {"p_no_batt", "p_post_batt", "c_root_t"}
+    required = {"p_no_batt", "p_post_batt", "c_{i,t}"}
     ref = results_list[0]
     if not required.issubset(ref["variables"]):
         missing = required - set(ref["variables"])
@@ -602,9 +602,9 @@ def plot_generation_and_cost(results_list, OUT_PATH):
     colors = [plt.cm.viridis(i / max(n_scen - 1, 1)) for i in range(n_scen)]
 
     p_no_batt = np.array(sorted_results[0]["variables"]["p_no_batt"], dtype=float)
-    c_root = np.array(sorted_results[0]["variables"]["c_root_t"], dtype=float)
-    gen_no_batt = p_no_batt[0, :]          # root node generation, shape (n_time,)
-    cost_no_batt = c_root * gen_no_batt
+    c_mat = np.array(sorted_results[0]["variables"]["c_{i,t}"], dtype=float)
+    gen_no_batt = p_no_batt.sum(axis=0)          # sum over nodes → shape (n_time,)
+    cost_no_batt = (c_mat * p_no_batt).sum(axis=0)
     hours = np.arange(len(gen_no_batt))
 
     fig, (ax_gen, ax_cost) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
@@ -619,21 +619,21 @@ def plot_generation_and_cost(results_list, OUT_PATH):
     for r, color in zip(sorted_results, colors):
         total_cap = sum(r["variables"]["e^{batt}_{j,max}"])
         p_post = np.array(r["variables"]["p_post_batt"], dtype=float)
-        gen_post = p_post[0, :]
-        cost_post = c_root * gen_post
+        gen_post = p_post.sum(axis=0)
+        cost_post = (c_mat * p_post).sum(axis=0)
         ax_gen.plot(hours, gen_post, color=color, linewidth=1.5, alpha=0.85)
         ax_cost.plot(hours, cost_post, color=color, linewidth=1.5, alpha=0.85)
         cap_handles.append(
             Line2D([0], [0], color=color, linewidth=2, label=f"{total_cap:.1f} MWh")
         )
 
-    ax_gen.set_ylabel("Generation (MW)")
-    ax_gen.set_title("Root-Node Generation With and Without Batteries")
+    ax_gen.set_ylabel("Total Generation (MW)")
+    ax_gen.set_title("System Generation With and Without Batteries")
     ax_gen.grid(True, linestyle="--", alpha=0.4)
 
     ax_cost.set_xlabel("Hour")
-    ax_cost.set_ylabel("Generation Cost ($/h)")
-    ax_cost.set_title("Weighted Generation Cost With and Without Batteries")
+    ax_cost.set_ylabel("Total Generation Cost ($/h)")
+    ax_cost.set_title("System Generation Cost With and Without Batteries")
     ax_cost.grid(True, linestyle="--", alpha=0.4)
 
     ax_gen.legend(handles=cap_handles, title="Battery Capacity",
@@ -917,6 +917,6 @@ def main_multi_version(versions=("v_1", "v_2", "v_3", "v_4")):
 
 
 if __name__ == "__main__":
-    date_string = "spring6"
+    date_string = "spring_neg_costs_root_battery"
     main(date_string)
     # main_multi_version()
