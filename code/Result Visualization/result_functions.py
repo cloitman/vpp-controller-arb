@@ -917,6 +917,6 @@ def main_multi_version(versions=("v_1", "v_2", "v_3", "v_4")):
 
 
 if __name__ == "__main__":
-    date_string = "spring4"
+    date_string = "spring6"
     main(date_string)
     # main_multi_version()

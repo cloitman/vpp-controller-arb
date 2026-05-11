@@ -7,10 +7,9 @@ from src.vpp_controller.results_format import save_day_optimization_result
 from src.vpp_controller.runner import (
     run_battery_arbitrage_problem,
     run_lmp_problem,
-    run_post_battery_lmp_problem,
 )
 
-opVersion = 'spring5'
+opVersion = 'spring6'
 
 
 def main() -> None:
@@ -41,29 +40,24 @@ def main() -> None:
 
     for batt_cap in batt_caps:
         print("\n" + "=" * 50)
-        print(f"Stage 2: battery arbitrage with capacity = {batt_cap} MWh")
+        print(f"Stage 2: network-constrained battery OPF, capacity = {batt_cap} MWh")
 
         batt_cap = float(batt_cap)
 
         arb_result = run_battery_arbitrage_problem(
             topology_df=topology_df,
             demand_df=demand_df,
+            price_df_root_node=price_df,
             lmp=lmp,
             total_battery_capacity=batt_cap,
         )
 
         print(f"  Status: {arb_result.status}  |  Profit: {arb_result.objective_value:.2f}")
 
-        print("  Stage 3: computing post-battery LMPs and OPF")
-        post_lmp, post_result = run_post_battery_lmp_problem(
-            topology_df=topology_df,
-            demand_df=demand_df,
-            price_df_root_node=price_df,
-            arb_result=arb_result,
-        )
-        arb_result.variables["post_battery_lmp"] = post_lmp
-        arb_result.variables["p_post_batt"] = post_result.variables["p_{i,t}"]
-        arb_result.variables["V_post_batt"] = post_result.variables["V_{i,t}"]
+        # Stage 2 now includes the full OPF, so post-battery generation, voltage,
+        # and LMPs come directly from its solution — no separate Stage 3 needed.
+        arb_result.variables["p_post_batt"] = arb_result.variables["p_{i,t}"]
+        arb_result.variables["V_post_batt"] = arb_result.variables["V_{i,t}"]
         arb_result.variables["p_no_batt"] = lmp_result.variables["p_{i,t}"]
         arb_result.variables["V_no_batt"] = lmp_result.variables["V_{i,t}"]
         arb_result.variables["c_root_t"] = lmp_result.variables["c_root_t"]

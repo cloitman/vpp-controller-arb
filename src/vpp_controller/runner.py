@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from .optimization_minimization import formulate_vpp_problem_minimization
-from .optimization_maximization import formulate_battery_arbitrage_problem
+from .optimization_maximization import formulate_battery_opf_problem
 
 
 @dataclass(frozen=True)
@@ -155,31 +155,58 @@ def run_lmp_problem(
 def run_battery_arbitrage_problem(
     topology_df: pd.DataFrame,
     demand_df: pd.DataFrame,
+    price_df_root_node: pd.DataFrame,
     lmp: np.ndarray,
     total_battery_capacity: float,
+    voltage_slack_penalty: float = 0.0,
 ) -> DayOptimizationResult:
     """
-    Stage 2: allocate batteries across nodes to maximise LMP arbitrage profit.
+    Stage 2: network-constrained battery OPF to maximise LMP arbitrage profit.
 
-    The network is not re-solved here.  The LMPs from Stage 1 are treated as
-    fixed market prices.  The problem is a pure LP over battery variables.
+    Full OPF constraints (power balance, KVL, thermal limits, voltage bounds)
+    are included with battery variables in the power balance.  This ensures the
+    optimised battery dispatch is network-feasible.
+
+    Post-battery LMPs are extracted from the dual variables of the active power
+    balance equality constraints and stored in variables["post_battery_lmp"].
+    Generation and voltage profiles post-battery are stored in variables["p_{i,t}"]
+    and variables["V_{i,t}"] respectively.
 
     Parameters
     ----------
+    price_df_root_node : pd.DataFrame
+        Root-node price curve ($/MWh per hour), used to build generation cost c.
     lmp : np.ndarray, shape (n_nodes, n_time)
-        Nodal LMPs from Stage 1.
+        Nodal LMPs from Stage 1 — used as fixed market prices in the objective.
     total_battery_capacity : float
         Total energy capacity budget across all nodes (MWh).
+    voltage_slack_penalty : float
+        If > 0, voltage bounds become soft with this penalty weight.
     """
+    price_series = price_df_root_node["$/MW"]
     model_inputs = build_model_inputs_maximization(
         topology_df=topology_df,
         demand_df=demand_df,
+        price_series_root_node=price_series,
         lmp=lmp,
         total_battery_capacity=total_battery_capacity,
+        voltage_slack_penalty=voltage_slack_penalty,
     )
 
-    formulation = formulate_battery_arbitrage_problem(**model_inputs)
-    solve_formulation_problem(formulation.problem)
+    formulation = formulate_battery_opf_problem(**model_inputs)
+    _solve_for_lmp_duals(formulation.problem, verbose=False)
+
+    n_nodes = formulation.dimensions["|N|"]
+    n_time = formulation.dimensions["|T|"]
+    node_order: list[int] = formulation.dimensions["active_power_balance_node_order"]
+    balance_constraints = formulation.constraints["active_power_balance"]
+
+    # Extract post-battery LMPs from active power balance duals.
+    post_battery_lmp = np.zeros((n_nodes, n_time))
+    for ci, j_idx in enumerate(node_order):
+        raw_dual = balance_constraints[ci].dual_value
+        if raw_dual is not None:
+            post_battery_lmp[j_idx, :] = -np.asarray(raw_dual, dtype=float).reshape(-1)
 
     duals = {
         group: [np.array(con.dual_value) for con in group_constraints]
@@ -189,9 +216,8 @@ def run_battery_arbitrage_problem(
         name: np.array(var.value) if hasattr(var, "value") else np.array(var)
         for name, var in formulation.variables.items()
     }
-    # Embed the LMP array so it is saved alongside battery variables and can
-    # be loaded later without re-running Stage 1.
     variables["lmp"] = lmp
+    variables["post_battery_lmp"] = post_battery_lmp
 
     diagnostics = {
         "solver": formulation.problem.solver_stats.solver_name,
@@ -283,10 +309,12 @@ def build_model_inputs_maximization(
     *,
     topology_df: pd.DataFrame,
     demand_df: pd.DataFrame,
+    price_series_root_node: pd.Series | np.ndarray,
     lmp: np.ndarray,
     total_battery_capacity: float,
+    voltage_slack_penalty: float = 0.0,
 ) -> Dict[str, Any]:
-    """Build keyword-argument dict for formulate_battery_arbitrage_problem."""
+    """Build keyword-argument dict for formulate_battery_opf_problem."""
     node_col = _detect_node_column(topology_df)
     nodes = topology_df[node_col].to_numpy(dtype=int)
     n_nodes = len(nodes)
@@ -296,16 +324,23 @@ def build_model_inputs_maximization(
     i_max_matrix = _parse_vector_column(topology_df["I_max"], n_nodes)
 
     edges: list[Tuple[int, int]] = []
+    r_list: list[float] = []
+    x_list: list[float] = []
+    i_max_list: list[float] = []
+
     for i in range(n_nodes):
         for j in range(n_nodes):
             if r_matrix[i, j] > 1e-3 or x_matrix[i, j] > 1e-3 or i_max_matrix[i, j] > 1e-3:
                 edges.append((int(nodes[i]), int(nodes[j])))
+                r_list.append(float(r_matrix[i, j]))
+                x_list.append(float(x_matrix[i, j]))
+                i_max_list.append(float(i_max_matrix[i, j]))
 
     rho = {int(i): 0 for i in nodes}
     for i, j in edges:
         rho[int(j)] = int(i)
 
-    hourly_l_P, _ = _extract_hourly_demand(demand_df, n_nodes=n_nodes)
+    hourly_l_P, hourly_l_Q = _extract_hourly_demand(demand_df, n_nodes=n_nodes)
     n_time = hourly_l_P.shape[1]
 
     if lmp.shape != (n_nodes, n_time):
@@ -313,11 +348,31 @@ def build_model_inputs_maximization(
             f"lmp shape {lmp.shape} does not match (n_nodes={n_nodes}, n_time={n_time})."
         )
 
+    price = np.asarray(price_series_root_node, dtype=float).reshape(-1)
+    if price.shape[0] != n_time:
+        raise ValueError("Price curve length must match number of time steps.")
+
+    c = np.zeros_like(hourly_l_P)
+    c[0, :] = price
+
+    s_max = topology_df["s_max"].to_numpy(dtype=float)
+    v_min = float(topology_df["v_min"].iloc[0])
+    v_max = float(topology_df["v_max"].iloc[0])
+
     return {
         "N": list(nodes),
         "E": edges,
         "T": list(range(n_time)),
         "rho": rho,
+        "l_P": hourly_l_P,
+        "l_Q": hourly_l_Q,
+        "c": c,
+        "s_max": s_max,
+        "r": np.array(r_list),
+        "x": np.array(x_list),
+        "I_max": np.array(i_max_list),
+        "v_min": v_min,
+        "v_max": v_max,
         "lmp": lmp,
         "eta_ch": 0.95,
         "eta_dis": 0.95,
@@ -325,6 +380,8 @@ def build_model_inputs_maximization(
         "delta_t": 1.0,
         "e_0": 0.0,
         "e_batt_max": float(total_battery_capacity),
+        "v_0": 1.0,
+        "voltage_slack_penalty": voltage_slack_penalty,
     }
 
 
@@ -455,15 +512,15 @@ def _subtract_battery_from_demand(demand_df: pd.DataFrame, p_batt_net: np.ndarra
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _solve_for_lmp_duals(problem: cp.Problem) -> None:
-    """Solve the LMP OPF preferring solvers that reliably populate dual variables."""
+def _solve_for_lmp_duals(problem: cp.Problem, verbose: bool = True) -> None:
+    """Solve the OPF preferring solvers that reliably populate dual variables."""
     # ECOS is tried first because CLARABEL may return None for SOCP equality duals.
     preferred = ["ECOS", "CLARABEL", "SCS"]
     installed = set(cp.installed_solvers())
 
     for solver_name in preferred:
         if solver_name in installed:
-            problem.solve(solver=solver_name, verbose=True)
+            problem.solve(solver=solver_name, verbose=verbose)
             return
 
     installed_list = ", ".join(sorted(installed)) if installed else "none"
