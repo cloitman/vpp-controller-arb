@@ -160,7 +160,7 @@ def plot_lmp_heatmap(results_dict, OUT_PATH):
         print("plot_lmp_heatmap: 'lmp' not found in variables, skipping.")
         return
 
-    lmp = np.array(results_dict["variables"]["lmp"], dtype=float)   # (n_nodes, n_time)
+    lmp = np.array(results_dict["variables"]["post_battery_lmp"], dtype=float)   # (n_nodes, n_time)
     total_cap = float(sum(results_dict["variables"]["e^{batt}_{j,max}"]))
     n_nodes, n_time = lmp.shape
 
@@ -323,6 +323,37 @@ def plot_input_lmp(results_list, OUT_PATH):
     ax.set_yticklabels([str(j) for j in range(n_nodes)])
     plt.tight_layout()
     plt.savefig(OUT_PATH / "input_lmp_heatmap.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
+def plot_output_lmp(results_list, OUT_PATH):
+    """Heatmap of the Stage-1 LMP used as input to the battery arbitrage problem.
+
+    Called once — the input LMP is capacity-independent, so any result in
+    results_list gives the same values.  Rows = nodes, columns = hours.
+
+    Args:
+        results_list: list of results dicts (any entry is used for the LMP).
+        OUT_PATH: output folder.
+    """
+    ref = results_list[0]
+    if "lmp" not in ref["variables"]:
+        print("plot_output_lmp: 'lmp' not found in variables, skipping.")
+        return
+
+    lmp = np.array(ref["variables"]["lmp"], dtype=float)
+    n_nodes, n_time = lmp.shape
+
+    fig, ax = plt.subplots(figsize=(max(10, n_time // 2), max(4, n_nodes // 2)))
+    im = ax.imshow(lmp, aspect="auto", origin="upper", cmap="RdYlGn_r")
+    plt.colorbar(im, ax=ax, label="LMP ($/MWh)")
+    ax.set_xlabel("Hour")
+    ax.set_ylabel("Node")
+    ax.set_title("Stage 1 LMP — Output from Battery Arbitrage (capacity-dependent)")
+    ax.set_xticks(range(0, n_time, max(1, n_time // 12)))
+    ax.set_yticks(range(n_nodes))
+    ax.set_yticklabels([str(j) for j in range(n_nodes)])
+    plt.tight_layout()
+    plt.savefig(OUT_PATH / "output_lmp_heatmap.png", dpi=150, bbox_inches="tight")
     plt.close()
 
 
@@ -606,7 +637,7 @@ def plot_generation_and_cost(results_list, OUT_PATH):
     gen_no_batt = p_no_batt.sum(axis=0)          # sum over nodes → shape (n_time,)
     cost_no_batt = (c_mat * p_no_batt).sum(axis=0)
     hours = np.arange(len(gen_no_batt))
-
+    print('No batt cost: ', cost_no_batt.sum())
     fig, (ax_gen, ax_cost) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
 
     ax_gen.plot(hours, gen_no_batt, color="black", linewidth=2, linestyle="--",
@@ -626,6 +657,7 @@ def plot_generation_and_cost(results_list, OUT_PATH):
         cap_handles.append(
             Line2D([0], [0], color=color, linewidth=2, label=f"{total_cap:.1f} MWh")
         )
+        print(f'gen: {total_cap:.1f} MWh', f'total cost: {cost_post.sum():.2f}')
 
     ax_gen.set_ylabel("Total Generation (MW)")
     ax_gen.set_title("System Generation With and Without Batteries")
@@ -832,8 +864,6 @@ def main(date_string):
             results_dict = get_results_dict(file)
         except Exception as e:
             print(f"Error reading {file}: {e}")
-            import pdb;pdb.set_trace()
-
         # Per-scenario 3D plots
         plot_battery_dispatch_3d(results_dict, OUT_PATH, normalize=False, filter_small_nodes=False)
         plot_lmp_heatmap(results_dict, OUT_PATH)
@@ -865,6 +895,10 @@ def main(date_string):
             plot_node_dispatch_and_lmp(results_list, interestNode, OUT_PATH)
         except Exception as e:
             print(f"  plot_node_dispatch_and_lmp node {interestNode}: {e}")
+        try:
+            plot_voltage_by_capacity(results_list, interestNode, OUT_PATH)
+        except Exception as e:
+            print(f"  plot_voltage_by_capacity node {interestNode}: {e}")
 
     # System-wide summary plots
     plot_objective_vs_capacity(results_list, OUT_PATH)
@@ -875,12 +909,7 @@ def main(date_string):
         plot_generation_and_cost(results_list, OUT_PATH)
     except Exception as e:
         print(f"  plot_generation_and_cost: {e}")
-
-    for interestNode in range(n_nodes):
-        try:
-            plot_voltage_by_capacity(results_list, interestNode, OUT_PATH)
-        except Exception as e:
-            print(f"  plot_voltage_by_capacity node {interestNode}: {e}")
+        
 
 
 def find_files_by_date(date_str):
